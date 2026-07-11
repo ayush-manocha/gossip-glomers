@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
-    "strings"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -19,6 +19,9 @@ func main() {
 	// Neighboring nodes
 	var neighbors []string
 
+	// Messages per neighbor that have not yet been acked
+	unacked := make(map[string]map[int]struct{})
+
 	var mu sync.Mutex
 
 	// Helper to gossip to a neighboring node
@@ -27,7 +30,13 @@ func main() {
 			"type":    "broadcast",
 			"message": message,
 		}
-		if err := n.Send(dest, body); err != nil {
+		if err := n.RPC(dest, body, func(reply maelstrom.Message) error {
+			// Remove message from unacked upon reply
+			mu.Lock()
+			delete(unacked[dest], message)
+			mu.Unlock()
+			return nil
+		}); err != nil {
 			log.Printf("gossip to %s failed: %s", dest, err)
 		}
 	}
@@ -49,16 +58,17 @@ func main() {
 		if !seen {
 			values[body.Message] = struct{}{}
 			nbrs = neighbors
+			for _, nbor := range nbrs {
+				if unacked[nbor] == nil {
+					unacked[nbor] = make(map[int]struct{})
+				}
+				unacked[nbor][body.Message] = struct{}{}
+			}
 		}
 		mu.Unlock()
 		for _, nbor := range nbrs {
 			gossip(nbor, body.Message)
 		}
-
-        // Don't need to ack node-to-node gossip
-        if strings.HasPrefix(msg.Src, "n") {
-            return nil
-        }
 
 		res := map[string]any{
 			"type": "broadcast_ok",
@@ -97,6 +107,9 @@ func main() {
 		// Get my neighbors
 		mu.Lock()
 		neighbors = body.Topology[n.ID()]
+		for _, nbor := range neighbors {
+			unacked[nbor] = make(map[int]struct{})
+		}
 		mu.Unlock()
 
 		res := map[string]any{
@@ -105,6 +118,28 @@ func main() {
 
 		return n.Reply(msg, res)
 	})
+
+	// At a regular interval, resend all unacked messages
+	go func() {
+		for range time.Tick(500 * time.Millisecond) {
+			mu.Lock()
+			snapshot := make(map[string][]int, len(unacked))
+			for nbor, owed := range unacked {
+				vals := make([]int, 0, len(owed))
+				for v := range owed {
+					vals = append(vals, v)
+				}
+				snapshot[nbor] = vals
+			}
+			mu.Unlock()
+
+			for nbor, vals := range snapshot {
+				for _, v := range vals {
+					gossip(nbor, v)
+				}
+			}
+		}
+	}()
 
 	// Execute the node's message loop, running until STDIN is closed
 	if err := n.Run(); err != nil {
