@@ -4,11 +4,34 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
+
+// Create tree topology with 5 children per node
+func setNeighbors(id string, nodeIDs []string) ([]string, map[string]map[int]struct{}) {
+	i := slices.Index(nodeIDs, id)
+	n := len(nodeIDs)
+
+	nborIdxs := []int{5*i + 1, 5*i + 2, 5*i + 3, 5*i + 4, 5*i + 5, (i - 1) / 5}
+	var neighbors []string
+
+	for _, v := range nborIdxs {
+		if v >= 0 && v < n && v != i {
+			neighbors = append(neighbors, nodeIDs[v])
+		}
+	}
+
+	unacked := make(map[string]map[int]struct{})
+	for _, nbor := range neighbors {
+		unacked[nbor] = make(map[int]struct{})
+	}
+
+	return neighbors, unacked
+}
 
 func main() {
 	n := maelstrom.NewNode()
@@ -20,9 +43,17 @@ func main() {
 	var neighbors []string
 
 	// Messages per neighbor that have not yet been acked
-	unacked := make(map[string]map[int]struct{})
+	var unacked map[string]map[int]struct{}
 
 	var mu sync.Mutex
+
+	// Initialize neighbors and unacked message tracker
+	n.Handle("init", func(msg maelstrom.Message) error {
+		mu.Lock()
+		neighbors, unacked = setNeighbors(n.ID(), n.NodeIDs())
+		mu.Unlock()
+		return nil
+	})
 
 	// Helper to gossip to a neighboring node
 	gossip := func(dest string, message int) {
@@ -57,12 +88,15 @@ func main() {
 		var nbrs []string
 		if !seen {
 			values[body.Message] = struct{}{}
-			nbrs = neighbors
-			for _, nbor := range nbrs {
+			for _, nbor := range neighbors {
+				if nbor == msg.Src {
+					continue
+				}
 				if unacked[nbor] == nil {
 					unacked[nbor] = make(map[int]struct{})
 				}
 				unacked[nbor][body.Message] = struct{}{}
+				nbrs = append(nbrs, nbor)
 			}
 		}
 		mu.Unlock()
@@ -95,23 +129,8 @@ func main() {
 		return n.Reply(msg, body)
 	})
 
-	// Handler for the "topology" message that stores node neighbors and ACKs
+	// Handler for the "topology" message that ignores topology suggestion and ACKs
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		var body struct {
-			Topology map[string][]string `json:"topology"`
-		}
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		// Get my neighbors
-		mu.Lock()
-		neighbors = body.Topology[n.ID()]
-		for _, nbor := range neighbors {
-			unacked[nbor] = make(map[int]struct{})
-		}
-		mu.Unlock()
-
 		res := map[string]any{
 			"type": "topology_ok",
 		}
@@ -121,7 +140,7 @@ func main() {
 
 	// At a regular interval, resend all unacked messages
 	go func() {
-		for range time.Tick(500 * time.Millisecond) {
+		for range time.Tick(1000 * time.Millisecond) {
 			mu.Lock()
 			snapshot := make(map[string][]int, len(unacked))
 			for nbor, owed := range unacked {

@@ -19,3 +19,7 @@ broadcast-b:
 broadcast-c:
 	go install ./maelstrom-broadcast
 	$(MAELSTROM) test -w broadcast --bin ~/go/bin/maelstrom-broadcast --node-count 5 --time-limit 20 --rate 10 --nemesis partition
+
+broadcast-d:
+	go install ./maelstrom-broadcast
+	$(MAELSTROM) test -w broadcast --bin ~/go/bin/maelstrom-broadcast --node-count 25 --time-limit 20 --rate 100 --latency 100
