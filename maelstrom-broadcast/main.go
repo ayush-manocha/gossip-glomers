@@ -56,15 +56,17 @@ func main() {
 	})
 
 	// Helper to gossip to a neighboring node
-	gossip := func(dest string, message int) {
+	gossip := func(dest string, msgs []int) {
 		body := map[string]any{
-			"type":    "broadcast",
-			"message": message,
+			"type":     "gossip",
+			"messages": msgs,
 		}
 		if err := n.RPC(dest, body, func(reply maelstrom.Message) error {
-			// Remove message from unacked upon reply
+			// Remove messages from unacked upon reply
 			mu.Lock()
-			delete(unacked[dest], message)
+			for _, v := range msgs {
+				delete(unacked[dest], v)
+			}
 			mu.Unlock()
 			return nil
 		}); err != nil {
@@ -72,7 +74,7 @@ func main() {
 		}
 	}
 
-	// Handler for the "broadcast" message that stores the value and ACKs
+	// Handler for the "broadcast" message from a client that stores the value and ACKs
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body struct {
 			Message int `json:"message"`
@@ -82,30 +84,59 @@ func main() {
 		}
 
 		// If I've already seen this value, then I've forwarded it and can ignore it
-		// If not, store and forward it
 		mu.Lock()
 		_, seen := values[body.Message]
-		var nbrs []string
+		// Note down unseen value as unacked by all neighbors
 		if !seen {
 			values[body.Message] = struct{}{}
 			for _, nbor := range neighbors {
-				if nbor == msg.Src {
-					continue
-				}
 				if unacked[nbor] == nil {
 					unacked[nbor] = make(map[int]struct{})
 				}
 				unacked[nbor][body.Message] = struct{}{}
-				nbrs = append(nbrs, nbor)
 			}
 		}
 		mu.Unlock()
-		for _, nbor := range nbrs {
-			gossip(nbor, body.Message)
-		}
 
 		res := map[string]any{
 			"type": "broadcast_ok",
+		}
+
+		return n.Reply(msg, res)
+	})
+
+	// Handler for the "gossip" message from another node that stores a batch of values and ACKs
+	n.Handle("gossip", func(msg maelstrom.Message) error {
+		var body struct {
+			Messages []int `json:"messages"`
+		}
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		// For each of the values, check if I've already seen it
+		// If so, then I've forwarded it and can ignore it
+		mu.Lock()
+		for _, v := range body.Messages {
+			_, seen := values[v]
+			// Note down unseen value as unacked by all neighbors
+			if !seen {
+				values[v] = struct{}{}
+				for _, nbor := range neighbors {
+					if nbor == msg.Src {
+						continue
+					}
+					if unacked[nbor] == nil {
+						unacked[nbor] = make(map[int]struct{})
+					}
+					unacked[nbor][v] = struct{}{}
+				}
+			}
+		}
+		mu.Unlock()
+
+		res := map[string]any{
+			"type": "gossip_ok",
 		}
 
 		return n.Reply(msg, res)
@@ -138,9 +169,9 @@ func main() {
 		return n.Reply(msg, res)
 	})
 
-	// At a regular interval, resend all unacked messages
+	// At a regular interval, send each neighbor all unacked messages
 	go func() {
-		for range time.Tick(1000 * time.Millisecond) {
+		for range time.Tick(200 * time.Millisecond) {
 			mu.Lock()
 			snapshot := make(map[string][]int, len(unacked))
 			for nbor, owed := range unacked {
@@ -153,8 +184,8 @@ func main() {
 			mu.Unlock()
 
 			for nbor, vals := range snapshot {
-				for _, v := range vals {
-					gossip(nbor, v)
+				if len(vals) > 0 {
+					gossip(nbor, vals)
 				}
 			}
 		}
